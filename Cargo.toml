@@ -1,0 +1,8 @@
+[package]
+name = "mcp23x17"
+version = "0.1.0"
+authors = ["haslersn <sebastian.hasler@gmx.net>"]
+edition = "2018"
+
+[dependencies]
+spidev = "0.3"

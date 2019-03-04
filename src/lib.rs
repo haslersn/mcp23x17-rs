@@ -10,6 +10,14 @@ use std::sync::Mutex;
 
 type Result<T = ()> = std::result::Result<T, Box<std::error::Error>>;
 
+// Mcp23s17 register addresses -- Source:
+// https://github.com/piface/pifacecommon/blob/006bca14c18d43ba2d9eafaa84ef83b512c51cf6/pifacecommon/mcp23s17.py#L17
+const IODIRA: u8 = 0x0; // I/O direction A
+const IODIRB: u8 = 0x1; // I/O direction B
+const GPPUB: u8 = 0xD; // port B pullups
+const GPIOA: u8 = 0x12; // port A
+const GPIOB: u8 = 0x13; // port B
+
 const HARDWARE_ADDRESS: u8 = 0;
 
 #[derive(Clone, Copy)]
@@ -27,11 +35,24 @@ enum PortLabel {
 impl PortLabel {
     fn address(&self) -> u8 {
         match self {
-            PortLabel::Out => 0x12,
-            PortLabel::In => 0x13,
+            PortLabel::Out => GPIOA,
+            PortLabel::In => GPIOB,
         }
     }
 }
+
+pub trait Reader {
+    fn read_value(&self) -> Result<IoValue>;
+}
+
+pub trait Writer: Reader {
+    fn set_low(&self) -> Result;
+    fn set_high(&self) -> Result;
+    fn set_value(&self, value: IoValue) -> Result;
+}
+
+pub type Input = Box<Reader>;
+pub type Output = Box<Writer>;
 
 #[derive(Clone)]
 pub struct Expander {
@@ -53,43 +74,39 @@ impl Expander {
     }
 
     pub fn output(&self, pin_num: u8) -> Output {
-        Output {
-            pin: Pin {
-                spi: self.spi.clone(),
-                label: PortLabel::Out,
-                num: pin_num,
-            },
-        }
+        Box::new(Pin {
+            spi: self.spi.clone(),
+            label: PortLabel::Out,
+            num: pin_num,
+        })
     }
 
     pub fn input(&self, pin_num: u8) -> Input {
-        Input {
-            pin: Pin {
-                spi: self.spi.clone(),
-                label: PortLabel::In,
-                num: pin_num,
-            },
-        }
+        Box::new(Pin {
+            spi: self.spi.clone(),
+            label: PortLabel::In,
+            num: pin_num,
+        })
     }
 
     pub fn output_byte(&self) -> Result<u8> {
         let spi = &self.spi.lock().unwrap();
-        Ok(read_byte(spi, PortLabel::Out)?)
+        Ok(read_port(spi, PortLabel::Out)?)
     }
 
     pub fn input_byte(&self) -> Result<u8> {
         let spi = &self.spi.lock().unwrap();
-        Ok(read_byte(spi, PortLabel::In)?)
+        Ok(read_port(spi, PortLabel::In)?)
     }
 }
 
 impl Debug for Expander {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         let spi = &self.spi.lock().unwrap();
-        let in_byte = read_byte(spi, PortLabel::In)
+        let in_byte = read_port(spi, PortLabel::In)
             .map(|b| b.to_string())
             .unwrap_or("NONE".to_string());
-        let out_byte = read_byte(spi, PortLabel::Out)
+        let out_byte = read_port(spi, PortLabel::Out)
             .map(|b| b.to_string())
             .unwrap_or("NONE".to_string());
         write!(f, "{{ In: {}, Out: {} }}", in_byte, out_byte)
@@ -97,58 +114,17 @@ impl Debug for Expander {
 }
 
 #[derive(Clone)]
-pub struct Output {
-    pin: Pin,
+pub struct Pin {
+    spi: Arc<Mutex<Spidev>>,
+    label: PortLabel,
+    num: u8,
 }
 
-impl Output {
-    pub fn to_input(&self) -> Input {
-        Input {
-            pin: self.pin.clone(),
-        }
-    }
-}
-
-impl Output {
-    pub fn set_low(&self) -> Result {
-        self.set_value(IoValue::Low)
-    }
-
-    pub fn set_high(&self) -> Result {
-        self.set_value(IoValue::High)
-    }
-
-    pub fn set_value(&self, value: IoValue) -> Result {
-        let mut spi = self.pin.spi.lock().unwrap();
-        let read_byte = read_byte(&spi, self.pin.label)?;
-
-        // calculate the state to write (write_byte)
-        let mask = 1 << self.pin.num;
-        let write_byte = match value {
-            IoValue::Low => read_byte & !mask,
-            IoValue::High => read_byte | mask,
-        };
-
-        // write
-        if read_byte != write_byte {
-            let tx_buf = [write_cmd(), self.pin.label.address(), write_byte];
-            spi.write(&tx_buf)?;
-        }
-
-        Ok(())
-    }
-}
-
-#[derive(Clone)]
-pub struct Input {
-    pin: Pin,
-}
-
-impl Input {
-    pub fn read_value(&self) -> Result<IoValue> {
-        let mask = 1 << self.pin.num;
-        let spi = self.pin.spi.lock().unwrap();
-        let read = read_byte(&spi, self.pin.label)?;
+impl Reader for Pin {
+    fn read_value(&self) -> Result<IoValue> {
+        let mask = 1 << self.num;
+        let spi = self.spi.lock().unwrap();
+        let read = read_port(&spi, self.label)?;
         Ok(match read & mask {
             0_u8 => IoValue::Low,
             _ => IoValue::High,
@@ -156,19 +132,55 @@ impl Input {
     }
 }
 
-#[derive(Clone)]
-struct Pin {
-    spi: Arc<Mutex<Spidev>>,
-    label: PortLabel,
-    num: u8,
+impl Writer for Pin {
+    fn set_low(&self) -> Result {
+        self.set_value(IoValue::Low)
+    }
+
+    fn set_high(&self) -> Result {
+        self.set_value(IoValue::High)
+    }
+
+    fn set_value(&self, value: IoValue) -> Result {
+        let mut spi = self.spi.lock().unwrap();
+        let did_read = read_port(&spi, self.label)?;
+
+        // calculate the state to write (to_write)
+        let mask = 1 << self.num;
+        let to_write = match value {
+            IoValue::Low => did_read & !mask,
+            IoValue::High => did_read | mask,
+        };
+
+        // write
+        if did_read != to_write {
+            write_port(&mut spi, self.label, to_write)?;
+        }
+
+        Ok(())
+    }
 }
 
-fn read_byte(spi: &Spidev, label: PortLabel) -> Result<u8> {
-    let tx_buf = [read_cmd(), label.address(), 0];
-    let mut rx_buf = [0; 3];
+fn read_port(spi: &Spidev, label: PortLabel) -> Result<u8> {
+    read_byte(spi, label.address())
+}
+
+fn read_byte(spi: &Spidev, address: u8) -> Result<u8> {
+    let tx_buf = [read_cmd(), address, 0];
+    let mut rx_buf = [0u8; 3];
     let mut transfer = SpidevTransfer::read_write(&tx_buf, &mut rx_buf);
     spi.transfer(&mut transfer)?;
     Ok(rx_buf[2])
+}
+
+fn write_port(spi: &mut Spidev, label: PortLabel, byte: u8) -> Result {
+    write_byte(spi, label.address(), byte)
+}
+
+fn write_byte(spi: &mut Spidev, address: u8, byte: u8) -> Result {
+    let tx_buf = [write_cmd(), address, byte];
+    spi.write(&tx_buf)?;
+    Ok(())
 }
 
 fn write_cmd() -> u8 {

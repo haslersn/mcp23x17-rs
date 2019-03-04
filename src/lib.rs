@@ -51,8 +51,8 @@ pub trait Writer: Reader {
     fn set_value(&self, value: IoValue) -> Result;
 }
 
-pub type Input = Box<Reader>;
-pub type Output = Box<Writer>;
+pub type Input = Box<Reader + Send>;
+pub type Output = Box<Writer + Send>;
 
 #[derive(Clone)]
 pub struct Expander {
@@ -68,6 +68,10 @@ impl Expander {
                 .max_speed_hz(100_000)
                 .mode(SPI_MODE_0),
         )?;
+        write_byte(&mut spi, GPIOA, 0)?;
+        write_byte(&mut spi, IODIRA, 0)?; // GPIOA are outputs
+        write_byte(&mut spi, IODIRB, 0xFF)?; // GPIOB are input
+        write_byte(&mut spi, GPPUB, 0xFF)?; // Enable input pullups
         Ok(Expander {
             spi: Arc::new(Mutex::new(spi)),
         })
